@@ -1022,16 +1022,18 @@ const Router = {
     Router.refreshBadges();
   },
   async refreshBadges(){
-    if(!Auth.isHrOrAdmin()) return;
-    const { count:c1 } = await sb.from('leave_requests').select('id', { count:'exact', head:true }).eq('status','pending');
-    const { count:c2 } = await sb.from('reimburse_requests').select('id', { count:'exact', head:true }).eq('status','pending');
-    const total = (c1||0) + (c2||0);
-    const badge = document.querySelector('[data-badge="pending"]');
-    if(badge){
-      badge.textContent = total;
-      badge.classList.toggle('hidden', total===0);
+    if(Auth.isHrOrAdmin()){
+      const { count:c1 } = await sb.from('leave_requests').select('id', { count:'exact', head:true }).eq('status','pending');
+      const { count:c2 } = await sb.from('reimburse_requests').select('id', { count:'exact', head:true }).eq('status','pending');
+      const total = (c1||0) + (c2||0);
+      const badge = document.querySelector('[data-badge="pending"]');
+      if(badge){
+        badge.textContent = total;
+        badge.classList.toggle('hidden', total===0);
+      }
     }
-    document.getElementById('notif-dot').classList.toggle('hidden', total===0);
+    const { count:unread } = await sb.from('notifications').select('id', { count:'exact', head:true }).eq('user_id', STATE.profile.id).eq('is_read', false);
+    document.getElementById('notif-dot').classList.toggle('hidden', !unread);
   }
 };
 
@@ -2333,17 +2335,32 @@ const App = {
       document.getElementById('profile-dropdown').classList.add('hidden');
       dd.classList.toggle('hidden');
       if(!dd.classList.contains('hidden')){
-        const activities = await Log.recent(6);
-        dd.innerHTML = activities.length ? activities.map(a=>`
-          <div class="dropdown-item" style="cursor:default;align-items:flex-start;">
-            <i class="fa-solid fa-circle-info" style="margin-top:2px;color:var(--primary);"></i>
+        const { data:notifs, error } = await sb.from('notifications')
+          .select('*').eq('user_id', STATE.profile.id)
+          .order('created_at', { ascending:false }).limit(8);
+        if(error){ dd.innerHTML = `<div class="text-sm text-muted" style="padding:12px;">Gagal memuat notifikasi</div>`; return; }
+        const iconFor = k => k==='success' ? 'fa-circle-check' : k==='danger' ? 'fa-circle-xmark' : 'fa-circle-info';
+        const colorFor = k => k==='success' ? 'var(--success)' : k==='danger' ? 'var(--danger)' : 'var(--primary)';
+        dd.innerHTML = (notifs && notifs.length) ? notifs.map(n=>`
+          <div class="dropdown-item" style="cursor:pointer;align-items:flex-start;${n.is_read?'opacity:.6;':''}" onclick="App.markNotifRead('${n.id}')">
+            <i class="fa-solid ${iconFor(n.kind)}" style="margin-top:2px;color:${colorFor(n.kind)};"></i>
             <div>
-              <div class="text-sm">${Util.escapeHtml(a.description||a.action)}</div>
-              <div class="text-xs text-muted">${Util.timeAgo(a.created_at)}</div>
+              <div class="text-sm" style="font-weight:${n.is_read?'400':'600'};">${Util.escapeHtml(n.title)}</div>
+              <div class="text-xs text-muted">${Util.escapeHtml(n.body)}</div>
+              <div class="text-xs text-muted">${Util.timeAgo(n.created_at)}</div>
             </div>
           </div>`).join('') : `<div class="text-sm text-muted" style="padding:12px;">Tidak ada notifikasi baru</div>`;
+        // mark all as read once opened/viewed
+        const unreadIds = (notifs||[]).filter(n=>!n.is_read).map(n=>n.id);
+        if(unreadIds.length){
+          await sb.from('notifications').update({ is_read:true }).in('id', unreadIds);
+          document.getElementById('notif-dot').classList.add('hidden');
+        }
       }
     });
+  },
+  async markNotifRead(id){
+    await sb.from('notifications').update({ is_read:true }).eq('id', id);
   },
 
   wireProfileDropdown(){
