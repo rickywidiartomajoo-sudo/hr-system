@@ -924,6 +924,59 @@ const ReimburseAPI = {
 };
 
 /* =====================================================================
+   10b. API — ATTENDANCE (ABSENSI)
+===================================================================== */
+const AttendanceAPI = {
+  todayStr(){
+    // uses local device date, matches att_date default (Asia/Jakarta) closely enough for same-day check-in/out
+    const d = new Date();
+    return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+  },
+  async myToday(){
+    const { data, error } = await sb.from('attendance').select('*')
+      .eq('employee_id', STATE.profile.id).eq('att_date', AttendanceAPI.todayStr()).maybeSingle();
+    if(error){ console.error(error); return null; }
+    return data;
+  },
+  async checkIn({ lat, lng, accuracy, photo_url }){
+    const { error } = await sb.from('attendance').insert({
+      employee_id: STATE.profile.id,
+      att_date: AttendanceAPI.todayStr(),
+      check_in_at: new Date().toISOString(),
+      check_in_lat: lat, check_in_lng: lng, check_in_accuracy: accuracy,
+      check_in_photo_url: photo_url
+    });
+    if(error) throw error;
+    await Log.record('check_in', `${STATE.profile.full_name} absen masuk`);
+  },
+  async checkOut(id, { lat, lng, accuracy, photo_url }){
+    const { error } = await sb.from('attendance').update({
+      check_out_at: new Date().toISOString(),
+      check_out_lat: lat, check_out_lng: lng, check_out_accuracy: accuracy,
+      check_out_photo_url: photo_url
+    }).eq('id', id);
+    if(error) throw error;
+    await Log.record('check_out', `${STATE.profile.full_name} absen pulang`);
+  },
+  async listMine(limit=30){
+    const { data, error } = await sb.from('attendance').select('*')
+      .eq('employee_id', STATE.profile.id).order('att_date', { ascending:false }).limit(limit);
+    if(error){ Toast.error(error.message); return []; }
+    return data;
+  },
+  async listAll({ employeeId=null, from=null, to=null } = {}){
+    let q = sb.from('attendance').select('*, profiles:employee_id(full_name, email, position_title, division)')
+      .order('att_date', { ascending:false });
+    if(employeeId) q = q.eq('employee_id', employeeId);
+    if(from) q = q.gte('att_date', from);
+    if(to) q = q.lte('att_date', to);
+    const { data, error } = await q;
+    if(error){ Toast.error(error.message); return []; }
+    return data;
+  }
+};
+
+/* =====================================================================
    11. API — SETTINGS & DASHBOARD
 ===================================================================== */
 const SettingsAPI = {
@@ -955,14 +1008,16 @@ const NAV_ITEMS = [
   { section:'Menu', items:[
     { id:'dashboard', label:'Dashboard', icon:'fa-solid fa-gauge-high', roles:['admin','hr','employee'] },
   ]},
-  { section:'HR', items:[
-    { id:'employees', label:'Data Karyawan', icon:'fa-solid fa-users', roles:['admin','hr'] },
-    { id:'approval', label:'Approval', icon:'fa-solid fa-stamp', roles:['admin','hr'], badgeKey:'pending' },
-  ]},
   { section:'Pengajuan', items:[
+    { id:'attendance', label:'Absensi', icon:'fa-solid fa-clock', roles:['admin','hr','employee'] },
     { id:'leave', label:'Cuti', icon:'fa-solid fa-plane-departure', roles:['admin','hr','employee'] },
     { id:'reimburse', label:'Reimburse', icon:'fa-solid fa-receipt', roles:['admin','hr','employee'] },
     { id:'history', label:'Riwayat', icon:'fa-solid fa-clock-rotate-left', roles:['admin','hr','employee'] },
+  ]},
+  { section:'HR', items:[
+    { id:'employees', label:'Data Karyawan', icon:'fa-solid fa-users', roles:['admin','hr'] },
+    { id:'approval', label:'Approval', icon:'fa-solid fa-stamp', roles:['admin','hr'], badgeKey:'pending' },
+    { id:'attendance-history', label:'Riwayat Absensi', icon:'fa-solid fa-calendar-check', roles:['admin','hr'] },
   ]},
   { section:'Lainnya', items:[
     { id:'activity', label:'Log Aktivitas', icon:'fa-solid fa-list-check', roles:['admin','hr'] },
@@ -973,6 +1028,7 @@ const NAV_ITEMS = [
 
 const PAGE_TITLES = {
   dashboard:'Dashboard', employees:'Data Karyawan', approval:'Approval',
+  attendance:'Absensi', 'attendance-history':'Riwayat Absensi',
   leave:'Pengajuan Cuti', reimburse:'Pengajuan Reimburse', history:'Riwayat Pengajuan',
   activity:'Log Aktivitas', profile:'Profil Saya', settings:'Pengaturan Perusahaan'
 };
@@ -1008,6 +1064,8 @@ const Router = {
         case 'dashboard': await Views.dashboard(); break;
         case 'employees': await Views.employees(); break;
         case 'approval': await Views.approval(); break;
+        case 'attendance': await Views.attendance(); break;
+        case 'attendance-history': await Views.attendanceHistory(); break;
         case 'leave': await Views.leave(); break;
         case 'reimburse': await Views.reimburse(); break;
         case 'history': await Views.history(); break;
@@ -1462,6 +1520,215 @@ Object.assign(Views, {
     `).join('');
   }
 });
+
+/* =====================================================================
+   15b. ATTENDANCE — camera + geolocation capture, views, modal
+===================================================================== */
+const AttendanceCapture = {
+  _stream: null,
+  async start(videoEl){
+    AttendanceCapture._stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:'user' }, audio:false });
+    videoEl.srcObject = AttendanceCapture._stream;
+    await videoEl.play();
+  },
+  stop(){
+    if(AttendanceCapture._stream){
+      AttendanceCapture._stream.getTracks().forEach(t=>t.stop());
+      AttendanceCapture._stream = null;
+    }
+  },
+  snapshot(videoEl){
+    const canvas = document.createElement('canvas');
+    canvas.width = videoEl.videoWidth || 480;
+    canvas.height = videoEl.videoHeight || 360;
+    canvas.getContext('2d').drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+    return new Promise(resolve => canvas.toBlob(blob => resolve(blob), 'image/jpeg', 0.85));
+  },
+  getLocation(){
+    return new Promise((resolve, reject) => {
+      if(!navigator.geolocation){ reject(new Error('Geolocation tidak didukung perangkat ini')); return; }
+      navigator.geolocation.getCurrentPosition(
+        pos => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude, accuracy: pos.coords.accuracy }),
+        err => reject(new Error('Gagal mengambil lokasi (aktifkan GPS & izinkan akses lokasi): ' + err.message)),
+        { enableHighAccuracy:true, timeout:15000, maximumAge:0 }
+      );
+    });
+  }
+};
+
+const AttendanceModal = {
+  _mode: null,
+  _attId: null,
+  _geo: null,
+  open(mode, attId=null){
+    AttendanceModal._mode = mode;
+    AttendanceModal._attId = attId;
+    AttendanceModal._geo = null;
+    ModalUI.open(`
+      <div class="modal-header"><h3>${mode==='in' ? 'Absen Masuk' : 'Absen Pulang'}</h3><button class="icon-btn" onclick="AttendanceModal.cancel()"><i class="fa-solid fa-xmark"></i></button></div>
+      <div class="modal-body">
+        <div class="text-sm text-muted mb-2">Pastikan wajah terlihat jelas di kamera dan lokasi (GPS) aktif.</div>
+        <div style="position:relative;border-radius:12px;overflow:hidden;background:#000;aspect-ratio:4/3;">
+          <video id="att-video" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;"></video>
+        </div>
+        <div class="text-xs text-muted mt-2" id="att-geo-status"><i class="fa-solid fa-location-crosshairs"></i> Mengambil lokasi...</div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline" onclick="AttendanceModal.cancel()">Batal</button>
+        <button class="btn btn-primary" id="att-capture-btn" onclick="AttendanceModal.capture()"><i class="fa-solid fa-camera"></i> Ambil Foto & Absen</button>
+      </div>
+    `, { size:'420px' });
+
+    AttendanceCapture.getLocation().then(geo => {
+      AttendanceModal._geo = geo;
+      const el = document.getElementById('att-geo-status');
+      if(el) el.innerHTML = `<i class="fa-solid fa-location-dot" style="color:var(--success);"></i> Lokasi didapat (akurasi ~${Math.round(geo.accuracy)}m)`;
+    }).catch(err => {
+      const el = document.getElementById('att-geo-status');
+      if(el) el.innerHTML = `<i class="fa-solid fa-triangle-exclamation" style="color:var(--danger);"></i> ${Util.escapeHtml(err.message)}`;
+    });
+
+    const videoEl = document.getElementById('att-video');
+    AttendanceCapture.start(videoEl).catch(err => {
+      Toast.error('Gagal mengakses kamera: ' + err.message);
+    });
+  },
+  cancel(){
+    AttendanceCapture.stop();
+    ModalUI.close();
+  },
+  async capture(){
+    const btn = document.getElementById('att-capture-btn');
+    if(!AttendanceModal._geo){ Toast.warning('Lokasi belum didapat, tunggu sebentar lalu coba lagi'); return; }
+    const videoEl = document.getElementById('att-video');
+    if(!videoEl || !videoEl.videoWidth){ Toast.warning('Kamera belum siap, tunggu sebentar'); return; }
+    btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+    try{
+      const blob = await AttendanceCapture.snapshot(videoEl);
+      const file = new File([blob], `selfie_${Date.now()}.jpg`, { type:'image/jpeg' });
+      const path = await Storage.upload('attendance', file);
+      const { lat, lng, accuracy } = AttendanceModal._geo;
+      if(AttendanceModal._mode === 'in'){
+        await AttendanceAPI.checkIn({ lat, lng, accuracy, photo_url: path });
+        Toast.success('Absen masuk berhasil');
+      } else {
+        await AttendanceAPI.checkOut(AttendanceModal._attId, { lat, lng, accuracy, photo_url: path });
+        Toast.success('Absen pulang berhasil');
+      }
+      AttendanceCapture.stop();
+      ModalUI.close();
+      await Router.go(STATE.route);
+    }catch(e){
+      Toast.error(e.message || 'Gagal absen');
+      btn.disabled = false; btn.innerHTML = '<i class="fa-solid fa-camera"></i> Ambil Foto & Absen';
+    }
+  },
+  async viewPhoto(path){
+    if(!path){ Toast.warning('Foto tidak tersedia'); return; }
+    const url = await Storage.getSignedUrl('attendance', path);
+    if(url) window.open(url, '_blank'); else Toast.error('Gagal memuat foto');
+  }
+};
+
+Object.assign(Views, {
+  async attendance(){
+    const [today, mine] = await Promise.all([AttendanceAPI.myToday(), AttendanceAPI.listMine(30)]);
+    document.getElementById('page-content').innerHTML = `
+      <div class="card-solid mb-4" style="max-width:520px;">
+        <div class="text-sm text-muted mb-2">${Util.formatDate(new Date())}</div>
+        <div class="flex items-center justify-between" style="gap:16px;flex-wrap:wrap;">
+          <div>
+            <div class="text-xs text-muted">Jam Masuk</div>
+            <div style="font-size:20px;font-weight:700;">${today?.check_in_at ? Util.formatDateTime(today.check_in_at).split(' ').slice(-1)[0] : '--:--'}</div>
+          </div>
+          <div>
+            <div class="text-xs text-muted">Jam Pulang</div>
+            <div style="font-size:20px;font-weight:700;">${today?.check_out_at ? Util.formatDateTime(today.check_out_at).split(' ').slice(-1)[0] : '--:--'}</div>
+          </div>
+          <div>
+            ${!today
+              ? `<button class="btn btn-primary" onclick="AttendanceModal.open('in')"><i class="fa-solid fa-right-to-bracket"></i> Absen Masuk</button>`
+              : !today.check_out_at
+                ? `<button class="btn btn-primary" onclick="AttendanceModal.open('out','${today.id}')"><i class="fa-solid fa-right-from-bracket"></i> Absen Pulang</button>`
+                : `<span class="badge badge-approved"><i class="fa-solid fa-check"></i> Absensi hari ini lengkap</span>`}
+          </div>
+        </div>
+      </div>
+      <div class="card-solid">
+        <div class="text-sm font-semibold mb-2">Riwayat Absensi Saya</div>
+        <div class="table-wrap"><table class="data-table">
+          <thead><tr><th>Tanggal</th><th>Jam Masuk</th><th>Jam Pulang</th><th>Lokasi Masuk</th><th>Foto</th></tr></thead>
+          <tbody id="att-tbody"></tbody>
+        </table></div>
+      </div>
+    `;
+    Views._renderAttRows(mine, false);
+  },
+  async attendanceHistory(){
+    const employees = (STATE.employees && STATE.employees.length) ? STATE.employees : await EmployeeAPI.list();
+    document.getElementById('page-content').innerHTML = `
+      <div class="card-solid mb-4">
+        <div class="flex gap-2" style="flex-wrap:wrap;align-items:flex-end;">
+          <div class="field" style="margin:0;">
+            <label>Karyawan</label>
+            <select class="input" id="att-filter-emp" style="min-width:200px;">
+              <option value="">Semua Karyawan</option>
+              ${employees.map(e=>`<option value="${e.id}">${Util.escapeHtml(e.full_name)}</option>`).join('')}
+            </select>
+          </div>
+          <div class="field" style="margin:0;"><label>Dari</label><input type="date" class="input" id="att-filter-from" /></div>
+          <div class="field" style="margin:0;"><label>Sampai</label><input type="date" class="input" id="att-filter-to" /></div>
+          <button class="btn btn-primary btn-sm" onclick="Views._loadAttHistory()"><i class="fa-solid fa-filter"></i> Filter</button>
+          <button class="btn btn-outline btn-sm" onclick="ExportUtil.excel(Views._attHistoryRows(),'absensi','Absensi')"><i class="fa-solid fa-file-excel"></i> Excel</button>
+          <button class="btn btn-outline btn-sm" onclick="ExportUtil.csv(Views._attHistoryRows(),'absensi')"><i class="fa-solid fa-file-csv"></i> CSV</button>
+        </div>
+      </div>
+      <div class="card-solid">
+        <div class="table-wrap"><table class="data-table">
+          <thead><tr><th>Tanggal</th><th>Karyawan</th><th>Jam Masuk</th><th>Jam Pulang</th><th>Lokasi Masuk</th><th>Foto</th></tr></thead>
+          <tbody id="att-all-tbody"></tbody>
+        </table></div>
+      </div>
+    `;
+    await Views._loadAttHistory();
+  },
+  async _loadAttHistory(){
+    const employeeId = document.getElementById('att-filter-emp')?.value || null;
+    const from = document.getElementById('att-filter-from')?.value || null;
+    const to = document.getElementById('att-filter-to')?.value || null;
+    const data = await AttendanceAPI.listAll({ employeeId, from, to });
+    Views._attHistoryData = data;
+    Views._renderAttRows(data, true);
+  },
+  _attHistoryRows(){
+    return (Views._attHistoryData||[]).map(r=>({
+      'Tanggal': Util.formatDate(r.att_date),
+      'Karyawan': r.profiles?.full_name || '-',
+      'Jam Masuk': r.check_in_at ? Util.formatDateTime(r.check_in_at) : '-',
+      'Jam Pulang': r.check_out_at ? Util.formatDateTime(r.check_out_at) : '-',
+    }));
+  },
+  _renderAttRows(data, showEmployee){
+    const tbody = document.getElementById(showEmployee ? 'att-all-tbody' : 'att-tbody');
+    if(!tbody) return;
+    if(!data.length){ tbody.innerHTML = `<tr><td colspan="${showEmployee?6:5}">${Views.emptyState('fa-clock','Belum ada data absensi','')}</td></tr>`; return; }
+    tbody.innerHTML = data.map(r => `
+      <tr>
+        <td class="text-sm">${Util.formatDate(r.att_date)}</td>
+        ${showEmployee ? `<td class="text-sm">${Util.escapeHtml(r.profiles?.full_name||'-')}</td>` : ''}
+        <td class="text-sm">${r.check_in_at ? Util.formatDateTime(r.check_in_at).split(' ').slice(-1)[0] : '-'}</td>
+        <td class="text-sm">${r.check_out_at ? Util.formatDateTime(r.check_out_at).split(' ').slice(-1)[0] : '-'}</td>
+        <td class="text-sm">${r.check_in_lat ? `<a href="https://www.google.com/maps?q=${r.check_in_lat},${r.check_in_lng}" target="_blank" rel="noopener"><i class="fa-solid fa-map-pin"></i> Lihat</a>` : '-'}</td>
+        <td class="text-sm">
+          ${r.check_in_photo_url ? `<button class="btn btn-ghost btn-sm" title="Foto masuk" onclick="AttendanceModal.viewPhoto('${r.check_in_photo_url}')"><i class="fa-solid fa-image"></i></button>` : ''}
+          ${r.check_out_photo_url ? `<button class="btn btn-ghost btn-sm" title="Foto pulang" onclick="AttendanceModal.viewPhoto('${r.check_out_photo_url}')"><i class="fa-solid fa-camera-retro"></i></button>` : ''}
+          ${(!r.check_in_photo_url && !r.check_out_photo_url) ? '-' : ''}
+        </td>
+      </tr>
+    `).join('');
+  }
+});
+
 
 const LeaveModal = {
   open(){
